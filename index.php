@@ -1,174 +1,491 @@
 <?php
-function readOdsFromUrl($url) {
-    $odsData = file_get_contents($url);
-    if (!$odsData) die("Error downloading file");
+session_start();
+require_once 'i18n.php';
 
-    $tempFile = tempnam(sys_get_temp_dir(), 'ods_') . '.ods';
-    file_put_contents($tempFile, $odsData);
+// If config does not exist, redirect to the importer
+if (!file_exists('config.php')) {
+    header("Location: importador.php");
+    exit;
+}
+require 'config.php';
 
-    $zip = new ZipArchive;
-    if ($zip->open($tempFile) !== TRUE) die("Error opening ODS");
-    
-    $contentXml = $zip->getFromName('content.xml');
-    $zip->close();
-    unlink($tempFile);
-
-    $xml = simplexml_load_string($contentXml);
-    $xml->registerXPathNamespace('table', 'urn:oasis:names:tc:opendocument:xmlns:table:1.0');
-    $xml->registerXPathNamespace('text', 'urn:oasis:names:tc:opendocument:xmlns:text:1.0');
-
-    $result = [];
-    
-    $sheets = $xml->xpath('//table:table');
-
-    foreach ($sheets as $sheet) {
-        $sheetName = (string)($sheet->attributes('table', true)->name ?? 'Sheet' . (count($result) + 1));
-        $columns = [];
-        $data = [];
-        
-        $rows = $sheet->xpath('.//table:table-row[not(@table:visibility="collapse")]');
-        
-        if (!empty($rows)) {
-            // Get non-empty column names from first row
-            $firstRow = $rows[0];
-            foreach ($firstRow->xpath('.//table:table-cell') as $cell) {
-                $colName = $cell->xpath('.//text:p') ? (string)$cell->xpath('.//text:p')[0] : '';
-                if (!empty(trim($colName))) {
-                    $columns[] = $colName;
-                }
-            }
-            
-            // Skip if no valid columns found
-            if (empty($columns)) {
-                continue;
-            }
-            
-            // Get non-empty data rows (skip first row)
-            foreach (array_slice($rows, 1) as $row) {
-                $rowData = [];
-                $cellIndex = 0;
-                $hasData = false;
-                
-                foreach ($row->xpath('.//table:table-cell') as $cell) {
-                    // Stop if we've processed all columns
-                    if ($cellIndex >= count($columns)) {
-                        break;
-                    }
-                    
-                    $value = $cell->xpath('.//text:p') ? (string)$cell->xpath('.//text:p')[0] : '';
-                    if (!empty(trim($value))) {
-                        $hasData = true;
-                    }
-                    $rowData[] = $value;
-                    $cellIndex++;
-                }
-                
-                // Only add row if it has data and matches column count
-                if ($hasData && count($rowData) == count($columns)) {
-                    $data[] = $rowData;
-                }
-            }
-        }
-
-        // Only add sheet if it has both columns and data
-        if (!empty($columns) && !empty($data)) {
-            $result[$sheetName] = [
-                'columns' => $columns,
-                'data' => $data
-            ];
-        }
-    }
-
-    return $result;
+// Handle language selection
+if (isset($_POST['lang']) && !empty($_POST['lang'])) {
+    $_SESSION['lang'] = $_POST['lang'];
 }
 
-function createDatabase($data) {
-    try {
-        $dbFile = 'ods_database.db';
-        
-        // Close any existing connections and delete old database
-        if (file_exists($dbFile)) {
-            // Close any existing PDO connections
-            if (isset($GLOBALS['db_connection']) && $GLOBALS['db_connection'] instanceof PDO) {
-                $GLOBALS['db_connection'] = null;
-            }
-              // Try multiple times to delete the file
-            $maxAttempts = 5;
-            $attempt = 0;
-            $deleted = false;
-            
-            while ($attempt < $maxAttempts && !$deleted) {
-                if (@unlink($dbFile)) {
-                    $deleted = true;
-                } else {
-                    $attempt++;
-                    usleep(100000); // Wait 100ms between attempts
-                }
-            }
-            
-            if (!$deleted) {
-                die("Error: Could not delete existing database file. Please close any programs using it.");
-            }
+// Handle logout
+if (isset($_GET['action']) && $_GET['action'] === 'logout') {
+    session_destroy();
+    header("Location: index.php");
+    exit;
+}
+
+// 1) Handle login if not already logged in
+if (!isset($_SESSION['loggedin'])) {
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login'])) {
+        $db = new SQLite3($config['db_name']);
+        $stmt = $db->prepare("SELECT * FROM users WHERE username = :username AND password = :password");
+        $stmt->bindValue(':username', $_POST['username'], SQLITE3_TEXT);
+        $stmt->bindValue(':password', $_POST['password'], SQLITE3_TEXT);
+        $result = $stmt->execute();
+        $user = $result->fetchArray(SQLITE3_ASSOC);
+        if ($user) {
+            $_SESSION['loggedin'] = true;
+            $_SESSION['username'] = $user['username'];
+        } else {
+            $login_error = t("invalid_credentials");
         }
-
-        // Create new SQLite database
-        $db = new PDO('sqlite:' . $dbFile);
-        $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-        $GLOBALS['db_connection'] = $db; // Store for cleanup
-
-        // Create SQLite database
-        $db = new PDO('sqlite:ods_database.db');
-        $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
-        foreach ($data as $sheetName => $sheetInfo) {
-            // Sanitize table name
-            $tableName = preg_replace('/[^a-zA-Z0-9_]/', '_', strtolower($sheetName));
-            
-            // Create table with ID column
-            $columns = ['id INTEGER PRIMARY KEY AUTOINCREMENT'];
-            foreach ($sheetInfo['columns'] as $col) {
-                $colName = preg_replace('/[^a-zA-Z0-9_]/', '_', strtolower($col));
-                $columns[] = "`$colName` TEXT NOT NULL DEFAULT ''";
-            }
-            
-            $createSQL = "CREATE TABLE IF NOT EXISTS `$tableName` (" 
-                        . implode(', ', $columns) . ")";
-            $db->exec($createSQL);
-            
-            // Insert data
-            if (!empty($sheetInfo['data'])) {
-                $colNames = array_map(function($col) {
-                    return '`' . preg_replace('/[^a-zA-Z0-9_]/', '_', strtolower($col)) . '`';
-                }, $sheetInfo['columns']);
-                
-                $insertSQL = "INSERT INTO `$tableName` (" 
-                           . implode(', ', $colNames) . ") VALUES (" 
-                           . implode(', ', array_fill(0, count($colNames), '?')) . ")";
-                
-                $stmt = $db->prepare($insertSQL);
-                foreach ($sheetInfo['data'] as $row) {
-                    // Convert empty strings to NULL
-                    $preparedRow = array_map(function($value) {
-                        return empty(trim($value)) ? null : $value;
-                    }, $row);
-                    $stmt->execute($preparedRow);
-                }
-            }
-        }
-        
-        echo "Database created successfully with non-empty data only: ods_database.db\n";
-    } catch (PDOException $e) {
-        die("Database error: " . $e->getMessage());
+    }
+    if (!isset($_SESSION['loggedin'])) {
+        // Show the login form and exit
+        ?>
+        <!doctype html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title><?php echo t("login_title"); ?></title>
+            <link rel="stylesheet" href="style.css">
+        </head>
+        <body>
+            <div class="header">
+                <div id="corporativo">
+                    <img src="grey.png" alt="Logo">
+                    <h1>Grey-<?php echo t("login_title"); ?></h1>
+                </div>
+            </div>
+            <div class="container contenedorlogin">
+                <div class="main" style="width:100%;">
+                    <h2>Grey-<?php echo t("login_title"); ?></h2>
+                    <?php if(isset($login_error)): ?>
+                        <p class="message" style="color:red;"><?php echo $login_error; ?></p>
+                    <?php endif; ?>
+                    <form method="post" action="index.php">
+                        <label><?php echo t("username"); ?>:</label>
+                        <input type="text" name="username" required>
+                        
+                        <label><?php echo t("password"); ?>:</label>
+                        <input type="password" name="password" required>
+                        
+                        <label>Language:</label>
+                        <select name="lang">
+                            <option value="en">English</option>
+                            <option value="es">Español</option>
+                            <option value="fr">Français</option>
+                            <option value="de">Deutsch</option>
+                            <option value="it">Italiano</option>
+                            <option value="ja">日本語</option>
+                            <option value="ko">한국어</option>
+                            <option value="zh">中文</option>
+                        </select>
+                        
+                        <input type="submit" name="login" value="<?php echo t("login_button"); ?>">
+                    </form>
+                </div>
+            </div>
+        </body>
+        </html>
+        <?php
+        exit;
     }
 }
 
-// Process ODS file and create database
-$url = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vQg0VTrvywSIoMxncJSJUuOxBsfXawFc6RS2RWz30g2BwFQ4UPCxlBXo24V4s7u8bn0MEcQ62sTuOpj/pub?output=ods';
-$data = readOdsFromUrl($url);
+// 2) If we reach here, user is logged in
+$db = new SQLite3($config['db_name']);
 
-if (empty($data)) {
-    die("No valid data found in the ODS file (all sheets were empty or had no columns)");
+// 3) Department selection: if department not chosen yet, show “pre-dashboard”
+if (!isset($_SESSION['department_id']) && !isset($_POST['department_id'])) {
+    // Fetch all departments
+    $res = $db->query("SELECT id, name FROM departments");
+    $departments = [];
+    while($dRow = $res->fetchArray(SQLITE3_ASSOC)) {
+        $departments[] = $dRow;
+    }
+
+    // Determine how many columns to use
+    $deptCount = count($departments);
+    $columns = 3; // default
+    if ($deptCount == 1) {
+        $columns = 1;
+    } elseif ($deptCount == 2) {
+        $columns = 2;
+    } elseif ($deptCount == 3) {
+        $columns = 3;
+    } elseif ($deptCount == 4) {
+        // 2 columns, so 2×2
+        $columns = 2;
+    } elseif ($deptCount == 5) {
+        // 3 columns (the 5th will wrap to next row)
+        $columns = 3;
+    } elseif ($deptCount == 6) {
+        // 3 columns, 2 rows (3×2)
+        $columns = 3;
+    } else {
+        // For more than 6, also do 3 columns
+        $columns = 3;
+    }
+    ?>
+    <!doctype html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>Select Department</title>
+        <link rel="stylesheet" href="style.css">
+    </head>
+    <body>
+    <div class="header">
+        <div id="corporativo">
+            <img src="grey.png" alt="Logo">
+            <h1>Select a Department</h1>
+        </div>
+    </div>
+    
+    <!-- 
+       We apply a dynamic inline style to define the grid-template-columns 
+       according to $columns.
+    -->
+    <div class="department-grid-container" 
+         style="grid-template-columns: repeat(<?php echo $columns; ?>, 1fr);">
+        <?php foreach ($departments as $dep): ?>
+            <div class="department-grid-item">
+                <form method="POST" action="index.php">
+                    <input type="hidden" name="department_id" value="<?php echo $dep['id']; ?>">
+                    <button type="submit" class="department-button">
+                    <div class="letra"><?php echo htmlspecialchars($dep['name'])[0]; ?></div>
+                        <?php echo htmlspecialchars($dep['name']); ?>
+                    </button>
+                </form>
+            </div>
+        <?php endforeach; ?>
+    </div>
+    </body>
+    </html>
+    <?php
+    exit;
 }
 
-createDatabase($data);
+// 4) If user submitted a department choice, store in session
+if (isset($_POST['department_id'])) {
+    $_SESSION['department_id'] = $_POST['department_id'];
+}
+$department_id = $_SESSION['department_id'] ?? null;
+
+// 5) Retrieve only the tables that belong to the chosen department
+$tables = [];
+if ($department_id) {
+    $stmtDept = $db->prepare("
+        SELECT table_name
+        FROM department_tables
+        WHERE department_id = :depid
+    ");
+    $stmtDept->bindValue(':depid', $department_id, SQLITE3_INTEGER);
+    $resultDept = $stmtDept->execute();
+    while($rowDept = $resultDept->fetchArray(SQLITE3_ASSOC)) {
+        $tables[] = $rowDept['table_name'];
+    }
+}
+
+// 6) Helper functions for foreign keys
+function isForeignKey($colName) {
+    return (substr_count($colName, '_') >= 1);
+}
+function parseForeignKey($colName) {
+    $parts = explode('_', $colName);
+    $referencedTable = array_shift($parts);
+    $displayColumns = $parts;
+    return [$referencedTable, $displayColumns];
+}
+
+// 7) Determine if user selected a table from side menu
+$selected_table = isset($_GET['table']) ? $_GET['table'] : null;
+$action = isset($_GET['action']) ? $_GET['action'] : 'list';
+$crud_message = '';
+
+// Security check: if table is not in $tables, deny
+if ($selected_table && !in_array($selected_table, $tables)) {
+    die("Invalid or unauthorized table selected.");
+}
+
+// 8) Handle CRUD if a valid table is selected
+if ($selected_table && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (isset($_POST['create'])) {
+        // Insert a record
+        $colsQuery = $db->query("PRAGMA table_info('$selected_table')");
+        $fields = [];
+        $values = [];
+        while ($col = $colsQuery->fetchArray(SQLITE3_ASSOC)) {
+            if ($col['name'] === 'id') continue;
+            if (isset($_POST[$col['name']])) {
+                $fields[] = $col['name'];
+                $values[] = "'" . SQLite3::escapeString($_POST[$col['name']]) . "'";
+            }
+        }
+        if (!empty($fields)) {
+            $sql = "INSERT INTO \"$selected_table\" (" . implode(',', $fields) . ") VALUES (" . implode(',', $values) . ")";
+            $db->exec($sql);
+            $crud_message = "Record created.";
+            $action = 'list';
+        }
+    } elseif (isset($_POST['update'])) {
+        // Update a record
+        $id = $_POST['id'];
+        $colsQuery = $db->query("PRAGMA table_info('$selected_table')");
+        $setParts = [];
+        while ($col = $colsQuery->fetchArray(SQLITE3_ASSOC)) {
+            if ($col['name'] === 'id') continue;
+            if (isset($_POST[$col['name']])) {
+                $setParts[] = $col['name'] . "='" . SQLite3::escapeString($_POST[$col['name']]) . "'";
+            }
+        }
+        if (!empty($setParts)) {
+            $sql = "UPDATE \"$selected_table\" SET " . implode(',', $setParts) . " WHERE id='" . SQLite3::escapeString($id) . "'";
+            $db->exec($sql);
+            $crud_message = "Record updated.";
+            $action = 'list';
+        }
+    } elseif (isset($_POST['delete'])) {
+        // Delete a record
+        $id = $_POST['id'];
+        $sql = "DELETE FROM \"$selected_table\" WHERE id='" . SQLite3::escapeString($id) . "'";
+        $db->exec($sql);
+        $crud_message = "Record deleted.";
+        $action = 'list';
+    }
+}
 ?>
+<!doctype html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title><?php echo t("dashboard_title"); ?></title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+    <div id="corporativo">
+        <img src="grey.png" alt="Logo">
+        <h1><?php echo t("dashboard_title"); ?></h1>
+    </div>
+    <!-- Top-right: user info and logout -->
+    <div style="position:absolute; top:15px; right:20px; font-size:10px;">
+        <?php echo t("hello"); ?>, <?php echo htmlspecialchars($_SESSION['username']); ?>
+        <a href="?action=logout" class="boton"><?php echo t("logout"); ?></a>
+    </div>
+</div>
+
+<div class="container">
+
+    <!-- Left nav: show only the tables from the chosen department -->
+    <div class="nav">
+        <h3><?php echo t("tables"); ?></h3>
+        <?php foreach ($tables as $table): ?>
+            <a href="?table=<?php echo urlencode($table); ?>"
+               class="<?php echo ($selected_table === $table) ? 'active' : ''; ?>">
+               <?php echo htmlspecialchars($table); ?>
+            </a>
+        <?php endforeach; ?>
+        <hr>
+        
+        <!-- Optional: Let user “change department” by hitting a small script -->
+        <form action="change_department.php" method="post">
+            <input type="submit" class="btn boton" value="Change Department">
+        </form>
+        
+        <!-- Relaunch importer link -->
+        <a href="importador.php" class="btn boton"><?php echo t("relaunch_importer"); ?></a>
+    </div>
+
+    <!-- Main content area -->
+    <div class="main">
+        <?php if ($selected_table): ?>
+            <h2><?php echo htmlspecialchars($selected_table); ?> Table</h2>
+            
+            <?php if ($crud_message): ?>
+                <p class="message"><?php echo $crud_message; ?></p>
+            <?php endif; ?>
+            
+            <?php
+            // Get column metadata
+            $colsQuery = $db->query("PRAGMA table_info('$selected_table')");
+            $columns = [];
+            while ($col = $colsQuery->fetchArray(SQLITE3_ASSOC)) {
+                $columns[] = $col;
+            }
+            ?>
+
+            <!-- CREATE -->
+            <?php if ($action === 'create'): ?>
+                <h3><?php echo t("create_new_record"); ?></h3>
+                <form method="post">
+                    <?php foreach ($columns as $col):
+                        if ($col['name'] === 'id') continue;
+                        $colName = $col['name'];
+                        
+                        if (isForeignKey($colName)) {
+                            list($refTable, $displayCols) = parseForeignKey($colName);
+                            ?>
+                            <label><?php echo htmlspecialchars($colName); ?>:</label>
+                            <select name="<?php echo htmlspecialchars($colName); ?>">
+                                <option value="">-- Select --</option>
+                                <?php
+                                // Build a query to fetch ID + display columns from the referenced table
+                                $fkSql = "SELECT id, " 
+                                       . implode(", ", array_map(fn($c) => "\"$c\"", $displayCols))
+                                       . " FROM \"$refTable\"";
+                                $resultFK = $db->query($fkSql);
+                                while ($rowFK = $resultFK->fetchArray(SQLITE3_ASSOC)) {
+                                    $tmp = $rowFK;
+                                    unset($tmp['id']);
+                                    $displayStr = implode(" ", $tmp);
+                                    echo "<option value='" . htmlspecialchars($rowFK['id']) . "'>"
+                                         . htmlspecialchars($displayStr)
+                                         . "</option>";
+                                }
+                                ?>
+                            </select>
+                        <?php 
+                        } else { 
+                        ?>
+                            <label><?php echo htmlspecialchars($colName); ?>:</label>
+                            <input type="text" name="<?php echo htmlspecialchars($colName); ?>">
+                        <?php } ?>
+                    <?php endforeach; ?>
+                    <input type="submit" name="create" value="<?php echo t("create_new_record"); ?>">
+                    <a href="?table=<?php echo urlencode($selected_table); ?>&action=list" class="btn">
+                        <?php echo t("cancel"); ?>
+                    </a>
+                </form>
+
+            <!-- EDIT -->
+            <?php elseif ($action === 'edit' && isset($_GET['id'])): 
+                $id = $_GET['id'];
+                $stmt = $db->prepare("SELECT * FROM \"$selected_table\" WHERE id = :id LIMIT 1");
+                $stmt->bindValue(':id', $id, SQLITE3_TEXT);
+                $record = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+                if ($record):
+            ?>
+                    <h3><?php echo t("edit_record"); ?></h3>
+                    <form method="post">
+                        <input type="hidden" name="id" value="<?php echo htmlspecialchars($record['id']); ?>">
+                        
+                        <?php foreach ($columns as $col):
+                            if ($col['name'] === 'id') continue;
+                            $colName = $col['name'];
+                            
+                            if (isForeignKey($colName)) {
+                                list($refTable, $displayCols) = parseForeignKey($colName);
+                                ?>
+                                <label><?php echo htmlspecialchars($colName); ?>:</label>
+                                <select name="<?php echo htmlspecialchars($colName); ?>">
+                                    <option value="">-- Select --</option>
+                                    <?php
+                                    $fkSql = "SELECT id, " 
+                                            . implode(", ", array_map(fn($c) => "\"$c\"", $displayCols))
+                                            . " FROM \"$refTable\"";
+                                    $resultFK = $db->query($fkSql);
+                                    while ($rowFK = $resultFK->fetchArray(SQLITE3_ASSOC)) {
+                                        $tmp = $rowFK; 
+                                        unset($tmp['id']);
+                                        $displayStr = implode(" ", $tmp);
+                                        $selected = ($record[$colName] == $rowFK['id']) ? 'selected' : '';
+                                        echo "<option value='" . htmlspecialchars($rowFK['id']) . "' $selected>"
+                                             . htmlspecialchars($displayStr)
+                                             . "</option>";
+                                    }
+                                    ?>
+                                </select>
+                            <?php 
+                            } else { 
+                            ?>
+                                <label><?php echo htmlspecialchars($colName); ?>:</label>
+                                <input type="text" 
+                                       name="<?php echo htmlspecialchars($colName); ?>" 
+                                       value="<?php echo htmlspecialchars($record[$colName]); ?>">
+                            <?php } ?>
+                        <?php endforeach; ?>
+                        
+                        <input type="submit" name="update" value="<?php echo t("edit_record"); ?>">
+                        <a href="?table=<?php echo urlencode($selected_table); ?>&action=list" class="btn">
+                            <?php echo t("cancel"); ?>
+                        </a>
+                    </form>
+            <?php 
+                endif; // record check
+            ?>
+
+            <!-- LIST ALL RECORDS -->
+            <?php else: ?>
+                <div class="actions">
+                    <a href="?table=<?php echo urlencode($selected_table); ?>&action=create" class="btn">
+                        <?php echo t("create_new_record"); ?>
+                    </a>
+                </div>
+                <h3><?php echo t("records"); ?></h3>
+                
+                <table>
+                    <tr>
+                        <?php foreach ($columns as $col): ?>
+                            <th><?php echo htmlspecialchars($col['name']); ?></th>
+                        <?php endforeach; ?>
+                        <th>Actions</th>
+                        <th>Métodos</th>
+                    </tr>
+                    <?php
+                    $records = $db->query("SELECT * FROM \"$selected_table\"");
+                    while ($rowData = $records->fetchArray(SQLITE3_ASSOC)) {
+                        echo "<tr>";
+                        foreach ($columns as $col) {
+                            $colName = $col['name'];
+                            if (isForeignKey($colName)) {
+                                list($refTable, $displayCols) = parseForeignKey($colName);
+                                $stmtFK = $db->prepare("
+                                    SELECT " 
+                                    . implode(", ", array_map(fn($c) => "\"$c\"", $displayCols))
+                                    . " FROM \"$refTable\" WHERE id = :fkid
+                                ");
+                                $stmtFK->bindValue(':fkid', $rowData[$colName], SQLITE3_TEXT);
+                                $resultFK = $stmtFK->execute()->fetchArray(SQLITE3_ASSOC);
+                                $displayText = $resultFK ? implode(" ", $resultFK) : $rowData[$colName];
+                                echo "<td>" . htmlspecialchars($displayText) . "</td>";
+                            } else {
+                                echo "<td>" . htmlspecialchars($rowData[$colName]) . "</td>";
+                            }
+                        }
+                        echo "<td>";
+                        echo "<a href='?table=$selected_table&action=edit&id={$rowData['id']}' class='boton'>Edit</a>";
+                        ?>
+                        <form method="post" class="inline" 
+                              onsubmit="return confirm('<?php echo t("delete_record"); ?>');" 
+                              style="display:inline;">
+                            <input type="hidden" name="id" value="<?php echo htmlspecialchars($rowData['id']); ?>">
+                            <input type="submit" name="delete" value="Delete">
+                        </form>
+                        <?php
+                        echo "</td>";
+                        
+                        // Métodos
+                        echo "<td>";
+                        foreach ($columns as $col) {
+                            $colName = $col['name'];
+                            $methodFile = "metodos/$selected_table/$colName.php";
+                            if (file_exists($methodFile)) {
+                                echo "<a class='boton' href='run_method.php?table=$selected_table&column=$colName&id={$rowData['id']}' target='_blank'>$colName</a><br>";
+                            }
+                        }
+                        echo "</td>";
+                        echo "</tr>";
+                    }
+                    ?>
+                </table>
+            <?php endif; ?>
+        <?php else: ?>
+            <p><?php echo t("select_table"); ?></p>
+        <?php endif; ?>
+    </div>
+</div>
+
+</body>
+</html>
+
